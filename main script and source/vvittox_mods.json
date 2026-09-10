@@ -1,0 +1,9 @@
+{
+  "name": "VVITTOX LAND",
+  "minecraft_version": "1.12.2",
+  "use_forge": true,
+  "forge_version": "1.12.2-14.23.5.2860",
+  "remote_manifest_url": "",
+  "remove_old_managed_mods": true,
+  "mods": []
+}
