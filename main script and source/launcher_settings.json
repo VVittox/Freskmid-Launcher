@@ -1,0 +1,10 @@
+{
+  "theme": "Классическая",
+  "ram": 4,
+  "mods_enabled": true,
+  "mod_loader": "Vanilla",
+  "curseforge_url": "",
+  "keep_launcher_open": true,
+  "use_java_args": true,
+  "java_args": ""
+}

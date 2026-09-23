@@ -1,0 +1,16 @@
+{
+  "profiles": {
+    "test": {
+      "username": "test",
+      "password": "",
+      "salt": "",
+      "skin": ""
+    },
+    "VVittox": {
+      "username": "VVittox",
+      "salt": "1c9401cddf61ffa2abed02e3106ccb3f",
+      "password": "eb99e9515dd6fd080c920f13f9c066cebba017b20f37078a7389840fa79b8aee",
+      "skin": "/Volumes/WDg 128/Work/VVITTOX Ресурсы/VVittox classic minecraft skin..png"
+    }
+  }
+}

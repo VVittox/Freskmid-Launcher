@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-import gzip
+
 import hashlib
+import hmac
 import json
 import math
 import os
 import random
+import secrets
+import shlex
 import shutil
 import struct
 import subprocess
@@ -13,6 +16,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import webbrowser
 from pathlib import Path
 from typing import Any, BinaryIO, Dict, List, Optional, Tuple
 from uuid import UUID
@@ -24,6 +28,7 @@ from PyQt5.QtCore import (
     QPropertyAnimation,
     QRect,
     QRectF,
+    QPoint,
     QSize,
     Qt,
     QThread,
@@ -46,6 +51,7 @@ from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QFrame,
     QGraphicsOpacityEffect,
     QGridLayout,
@@ -81,16 +87,17 @@ os.environ["QT_PLUGIN_PATH"] = os.path.join(
 )
 
 APP_NAME = "FRESKMID Launcher"
-APP_VERSION = "4.1.1"
+APP_VERSION = "4.2.0"
 ACCOUNTS_FILE = "accounts.json"
 SETTINGS_FILE = "launcher_settings.json"
 
-VVITTOX_SERVER_NAME = "VVITTOX LAND"
-VVITTOX_SERVER_VERSION = "1.12.2"
-VVITTOX_SERVER_HOST = "188.127.229.111"
-VVITTOX_SERVER_PORT = "30346"
-VVITTOX_SERVER_ADDRESS = f"{VVITTOX_SERVER_HOST}:{VVITTOX_SERVER_PORT}"
-VVITTOX_BANNER_FILE = "VL BG.jpg"
+PROMO_TITLE = "VVittox Works"
+PROMO_SUBTITLE = "Другие проекты VVittox, которые могут быть интересны."
+PROMO_BANNER_FILE = "Its all VVittox Works.png"
+CURSEFORGE_API_URL = "https://api.curseforge.com/v1"
+CURSEFORGE_MINECRAFT_GAME_ID = 432
+CURSEFORGE_MOD_CLASS_ID = 6
+CURSEFORGE_API_KEY = os.environ.get("CURSEFORGE_API_KEY", "").strip()
 
 BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 DATA_DIR = (
@@ -156,6 +163,12 @@ THEMES = {
 
 def asset_path(filename: str) -> str:
     return str(ASSETS_DIR / filename)
+
+
+def ensure_mods_folder() -> Path:
+    mods_dir = Path(minecraft_directory) / "mods"
+    mods_dir.mkdir(parents=True, exist_ok=True)
+    return mods_dir
 
 
 def get_max_ram() -> int:
@@ -315,64 +328,6 @@ def save_nbt_compound(path: Path, root: Dict[str, NBTValue]) -> None:
         _write_string(stream, "")
         _write_payload(stream, 10, root)
     os.replace(temporary, path)
-
-
-def ensure_vvittox_server(minecraft_dir: str) -> bool:
-    """
-    Добавляет сервер в servers.dat.
-
-    Возвращает True, если пришлось восстановить повреждённый/неподдерживаемый файл
-    из нового списка. Исходный файл при этом сохраняется как резервная копия.
-    """
-    server_file = Path(minecraft_dir) / "servers.dat"
-    recovered = False
-
-    if server_file.exists():
-        try:
-            root = load_nbt_compound(server_file)
-        except Exception:
-            backup = server_file.with_name("servers.dat.freskmid_backup")
-            if not backup.exists():
-                shutil.copy2(server_file, backup)
-            root = {}
-            recovered = True
-    else:
-        root = {}
-
-    servers_tag = root.get("servers")
-    if not servers_tag or servers_tag[0] != 9:
-        entries: List[Dict[str, NBTValue]] = []
-        root["servers"] = (9, (10, entries))
-    else:
-        element_type, entries = servers_tag[1]
-        if element_type != 10:
-            entries = []
-            root["servers"] = (9, (10, entries))
-
-    found = False
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        ip_tag = entry.get("ip")
-        if ip_tag and ip_tag[0] == 8 and str(ip_tag[1]).lower() == VVITTOX_SERVER_ADDRESS.lower():
-            entry["name"] = (8, VVITTOX_SERVER_NAME)
-            entry["ip"] = (8, VVITTOX_SERVER_ADDRESS)
-            found = True
-            break
-
-    if not found:
-        entries.insert(
-            0,
-            {
-                "name": (8, VVITTOX_SERVER_NAME),
-                "ip": (8, VVITTOX_SERVER_ADDRESS),
-                "hideAddress": (1, 0),
-            },
-        )
-
-    save_nbt_compound(server_file, root)
-    return recovered
-
 
 
 class ThemeManager:
@@ -550,7 +505,7 @@ class MinecraftParticlesBackground(QWidget):
 
 
 class AccountManager:
-    """Хранит только никнеймы. Пароли офлайн-лаунчеру не нужны."""
+    """Локальная система профилей VVittox Works Accounts."""
 
     def __init__(self) -> None:
         self.path = DATA_DIR / ACCOUNTS_FILE
@@ -562,20 +517,101 @@ class AccountManager:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             if isinstance(data, list):
                 return [str(item) for item in data if str(item).strip()]
-            if isinstance(data, dict):  
+            if isinstance(data, dict) and isinstance(data.get("profiles"), dict):
+                return [str(name) for name in data["profiles"] if str(name).strip()]
+            if isinstance(data, dict):
                 return [str(name) for name in data.keys() if str(name).strip()]
         except (OSError, ValueError):
             pass
         return []
 
-    def remember(self, username: str) -> None:
-        accounts = self.load_accounts()
-        if username not in accounts:
-            accounts.insert(0, username)
+    def _load_profiles(self) -> Dict[str, Dict[str, Any]]:
+        if not self.path.exists():
+            return {}
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("profiles"), dict):
+                return data["profiles"]
+            if isinstance(data, dict):
+                return {
+                    str(name): {"username": str(name), "password": "", "salt": "", "skin": ""}
+                    for name in data
+                }
+            if isinstance(data, list):
+                return {
+                    str(name): {"username": str(name), "password": "", "salt": "", "skin": ""}
+                    for name in data
+                }
+        except (OSError, ValueError, TypeError):
+            pass
+        return {}
+
+    def _save_profiles(self, profiles: Dict[str, Dict[str, Any]]) -> None:
         self.path.write_text(
-            json.dumps(accounts[:12], ensure_ascii=False, indent=2),
+            json.dumps({"profiles": profiles}, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+
+    def get_profile(self, username: str) -> Dict[str, Any]:
+        return dict(self._load_profiles().get(username, {"username": username, "skin": ""}))
+
+    def register(self, username: str, password: str) -> Tuple[bool, str]:
+        username = username.strip()
+        profiles = self._load_profiles()
+        if len(username) < 3:
+            return False, "Никнейм должен содержать минимум 3 символа."
+        if len(password) < 4:
+            return False, "Пароль должен содержать минимум 4 символа."
+        if username in profiles:
+            return False, "Такой аккаунт уже существует."
+        salt = secrets.token_hex(16)
+        digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 180000).hex()
+        profiles[username] = {"username": username, "salt": salt, "password": digest, "skin": ""}
+        self._save_profiles(profiles)
+        return True, "Аккаунт создан."
+
+    def authenticate(self, username: str, password: str) -> Tuple[bool, str]:
+        profile = self._load_profiles().get(username.strip())
+        if profile is None:
+            return False, "Аккаунт не найден. Зарегистрируйтесь."
+        if not profile.get("password"):
+            return True, "Старый офлайн-профиль подключён. Пароль можно добавить в профиле."
+        digest = hashlib.pbkdf2_hmac(
+            "sha256", password.encode(), str(profile.get("salt", "")).encode(), 180000
+        ).hex()
+        if not hmac.compare_digest(digest, str(profile.get("password", ""))):
+            return False, "Неверный пароль."
+        return True, "Вход выполнен."
+
+    def update_profile(self, username: str, new_username: str, password: str, skin: str) -> Tuple[bool, str]:
+        profiles = self._load_profiles()
+        profile = profiles.get(username)
+        if profile is None:
+            return False, "Профиль не найден."
+        new_username = new_username.strip()
+        if len(new_username) < 3:
+            return False, "Никнейм должен содержать минимум 3 символа."
+        if new_username != username and new_username in profiles:
+            return False, "Новый никнейм уже занят."
+        profile["username"] = new_username
+        profile["skin"] = skin
+        if password:
+            if len(password) < 4:
+                return False, "Новый пароль должен содержать минимум 4 символа."
+            salt = secrets.token_hex(16)
+            profile["salt"] = salt
+            profile["password"] = hashlib.pbkdf2_hmac(
+                "sha256", password.encode(), salt.encode(), 180000
+            ).hex()
+        profiles.pop(username, None)
+        profiles[new_username] = profile
+        self._save_profiles(profiles)
+        return True, new_username
+
+    def remember(self, username: str) -> None:
+        profiles = self._load_profiles()
+        profiles.setdefault(username, {"username": username, "password": "", "salt": "", "skin": ""})
+        self._save_profiles(profiles)
 
 
 class MinecraftButton(QPushButton):
@@ -675,16 +711,16 @@ class NavigationButton(QPushButton):
                 background: {hex_to_rgba(theme['primary'], 28)};
                 color: white;
             }}
+            QPushButton:pressed {{
+                background: {hex_to_rgba(theme['secondary'], 70)};
+                padding-left: 17px;
+            }}
             """
         )
 
 
-class FeaturedServerBanner(QPushButton):
-    """Стабильный баннер без вложенного QGraphicsEffect.
-
-    Вложенная тень конфликтовала с opacity-анимацией родительского экрана и
-    могла пропадать при постоянной перерисовке анимированного фона.
-    """
+class PromoBanner(QPushButton):
+    """Единый рекламный баннер со статичной картинкой проекта."""
 
     def __init__(self, main_window: "MainWindow") -> None:
         super().__init__()
@@ -694,7 +730,7 @@ class FeaturedServerBanner(QPushButton):
         self.setCursor(Qt.PointingHandCursor)
         self.setFixedHeight(190)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.setToolTip("Установить Minecraft 1.12.2 и войти на VVITTOX LAND")
+        self.setToolTip("Запустить выбранную версию Minecraft")
         self.setAttribute(Qt.WA_OpaquePaintEvent, True)
         self.setAutoFillBackground(False)
         self.reload_banner()
@@ -710,7 +746,7 @@ class FeaturedServerBanner(QPushButton):
         super().leaveEvent(event)
 
     def reload_banner(self) -> None:
-        loaded = QPixmap(asset_path(VVITTOX_BANNER_FILE))
+        loaded = QPixmap(asset_path(PROMO_BANNER_FILE))
         self.banner = loaded.copy() if not loaded.isNull() else QPixmap()
         self.update()
 
@@ -723,7 +759,6 @@ class FeaturedServerBanner(QPushButton):
         rect = full_rect.adjusted(1, 1, -1, -1)
         radius = 7
 
- 
         painter.fillRect(full_rect, QColor(theme["panel_alt"]))
 
         clip_path = QPainterPath()
@@ -772,7 +807,7 @@ class FeaturedServerBanner(QPushButton):
         painter.drawText(
             rect.adjusted(28, 24, -20, -20),
             Qt.AlignLeft | Qt.AlignTop,
-            VVITTOX_SERVER_NAME,
+            PROMO_TITLE,
         )
 
         painter.setFont(QFont("Segoe UI", 10, QFont.DemiBold))
@@ -780,7 +815,7 @@ class FeaturedServerBanner(QPushButton):
         painter.drawText(
             rect.adjusted(30, 72, -20, -20),
             Qt.AlignLeft | Qt.AlignTop,
-            f"Minecraft {VVITTOX_SERVER_VERSION} • SMP • Ванилла",
+            PROMO_SUBTITLE,
         )
 
         badge_rect = QRect(rect.left() + 29, rect.bottom() - 56, 250, 33)
@@ -789,15 +824,7 @@ class FeaturedServerBanner(QPushButton):
         painter.drawRoundedRect(badge_rect, 5, 5)
         painter.setPen(QColor(15, 20, 13))
         painter.setFont(QFont("Segoe UI", 9, QFont.Bold))
-        painter.drawText(badge_rect, Qt.AlignCenter, "УСТАНОВИТЬ 1.12.2 И ЗАЙТИ")
-
-        painter.setPen(QColor(230, 235, 240))
-        painter.setFont(QFont("Segoe UI", 9, QFont.DemiBold))
-        painter.drawText(
-            rect.adjusted(300, 0, -22, -24),
-            Qt.AlignRight | Qt.AlignBottom,
-            VVITTOX_SERVER_ADDRESS,
-        )
+        painter.drawText(badge_rect, Qt.AlignCenter, "ВЫБЕРИ ВЕРСИЮ И ЗАПУСТИ")
 
         if self.banner.isNull():
             painter.setPen(QColor(theme["muted"]))
@@ -805,7 +832,7 @@ class FeaturedServerBanner(QPushButton):
             painter.drawText(
                 rect.adjusted(300, 18, -20, -20),
                 Qt.AlignRight | Qt.AlignTop,
-                f"assets/{VVITTOX_BANNER_FILE}",
+                f"assets/{PROMO_BANNER_FILE}",
             )
 
 
@@ -820,7 +847,6 @@ class LaunchThread(QThread):
         self.version_id = ""
         self.username = ""
         self.settings: Dict[str, Any] = {}
-        self.direct_server = False
         self.progress = 0
         self.progress_max = 0
         self.progress_label = ""
@@ -830,12 +856,10 @@ class LaunchThread(QThread):
         version_id: str,
         username: str,
         settings: Dict[str, Any],
-        direct_server: bool = False,
     ) -> None:
         self.version_id = version_id
         self.username = username.strip()
         self.settings = dict(settings)
-        self.direct_server = direct_server
 
     def update_progress_label(self, value: str) -> None:
         self.progress_label = str(value)
@@ -870,16 +894,6 @@ class LaunchThread(QThread):
         try:
             Path(minecraft_directory).mkdir(parents=True, exist_ok=True)
 
-            if self.direct_server:
-                self.update_progress_label("Добавляю VVITTOX LAND в список серверов…")
-                recovered = ensure_vvittox_server(minecraft_directory)
-                if recovered:
-                    self.info_signal.emit(
-                        "Старый servers.dat не удалось прочитать. Он сохранён как "
-                        "servers.dat.freskmid_backup, а новый список создан автоматически."
-                    )
-                self.version_id = VVITTOX_SERVER_VERSION
-
             launch_version = self._install_and_resolve_version()
 
             username = self.username or generate_username()[0]
@@ -894,10 +908,10 @@ class LaunchThread(QThread):
                 "gameDirectory": minecraft_directory,
                 "jvmArguments": [f"-Xmx{selected_ram}G", "-Xms1G"],
             }
-
-            if self.direct_server:
-                options["server"] = VVITTOX_SERVER_HOST
-                options["port"] = VVITTOX_SERVER_PORT
+            if self.settings.get("use_java_args"):
+                custom_args = str(self.settings.get("java_args", "")).strip()
+                if custom_args:
+                    options["jvmArguments"].extend(shlex.split(custom_args))
 
             self.update_progress_label("Подготавливаю запуск Minecraft…")
             command = get_minecraft_command(
@@ -912,6 +926,88 @@ class LaunchThread(QThread):
             self.error_signal.emit(str(exc))
         finally:
             self.state_update_signal.emit(False)
+
+
+class CurseForgeSearchThread(QThread):
+    results_signal = pyqtSignal(list)
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, query: str, version: str, loader: str) -> None:
+        super().__init__()
+        self.query = query
+        self.version = version
+        self.loader = loader
+
+    def run(self) -> None:
+        if not CURSEFORGE_API_KEY:
+            self._search_modrinth()
+            return
+
+        params = {
+            "gameId": CURSEFORGE_MINECRAFT_GAME_ID,
+            "classId": CURSEFORGE_MOD_CLASS_ID,
+            "searchFilter": self.query,
+            "sortField": 2,
+            "sortOrder": "desc",
+            "pageSize": 24,
+        }
+        if self.version:
+            params["gameVersion"] = self.version
+        if self.loader and self.loader != "Авто":
+            params["modLoaderType"] = {"Forge": 1, "Fabric": 4, "Quilt": 5}.get(self.loader, 0)
+
+        request = urllib.request.Request(
+            f"{CURSEFORGE_API_URL}/mods/search?{urllib.parse.urlencode(params)}",
+            headers={"x-api-key": CURSEFORGE_API_KEY, "Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=25) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            results = []
+            for mod in payload.get("data", []):
+                results.append(
+                    {
+                        "id": mod.get("id"),
+                        "name": mod.get("name", "Без названия"),
+                        "author": mod.get("authors", [{}])[0].get("name", "CurseForge"),
+                        "summary": mod.get("summary", "").strip(),
+                        "downloads": int(mod.get("downloadCount", 0)),
+                        "icon": mod.get("logo", {}).get("url", ""),
+                        "url": mod.get("links", {}).get("websiteUrl", ""),
+                    }
+                )
+            self.results_signal.emit(results)
+        except Exception as exc:
+            self.error_signal.emit(f"CurseForge: {exc}")
+
+    def _search_modrinth(self) -> None:
+        params = {"query": self.query, "limit": 24, "index": "downloads"}
+        if self.version:
+            params["facets"] = json.dumps([["versions:" + self.version]])
+        request = urllib.request.Request(
+            "https://api.modrinth.com/v2/search?" + urllib.parse.urlencode(params),
+            headers={"User-Agent": "FRESKMID Launcher"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=25) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            results = []
+            for mod in payload.get("hits", []):
+                results.append(
+                    {
+                        "id": str(mod.get("project_id", "")),
+                        "source": "modrinth",
+                        "name": mod.get("title", "Без названия"),
+                        "author": mod.get("author", "Modrinth"),
+                        "summary": mod.get("description", "").strip(),
+                        "downloads": int(mod.get("downloads", 0)),
+                        "icon": mod.get("icon_url", ""),
+                        "url": "https://modrinth.com/mod/" + str(mod.get("slug", "")),
+                    }
+                )
+            self.results_signal.emit(results)
+        except Exception as exc:
+            self.error_signal.emit(f"Каталог модов: {exc}")
 
 
 class LoginScreen(FadeInWidget):
@@ -968,6 +1064,15 @@ class LoginScreen(FadeInWidget):
         self.remember_check = QCheckBox("Запомнить Аккаунт")
         self.remember_check.setChecked(True)
 
+        self.password_input = QLineEdit()
+        self.password_input.setPlaceholderText("Пароль VVittox Works Accounts")
+        self.password_input.setEchoMode(QLineEdit.Password)
+        self.password_input.setMinimumHeight(48)
+        self.password_input.returnPressed.connect(self.login)
+
+        self.register_button = MinecraftButton("Создать аккаунт", self.main_window.theme_manager, "secondary")
+        self.register_button.clicked.connect(self.register)
+
         self.login_button = MinecraftButton("Войти", self.main_window.theme_manager)
         self.login_button.clicked.connect(self.login)
 
@@ -975,10 +1080,12 @@ class LoginScreen(FadeInWidget):
         card_layout.addWidget(subtitle)
         card_layout.addSpacing(5)
         card_layout.addWidget(self.username_input)
+        card_layout.addWidget(self.password_input)
         card_layout.addWidget(self.saved_accounts)
         card_layout.addWidget(note)
         card_layout.addWidget(self.remember_check)
         card_layout.addWidget(self.login_button)
+        card_layout.addWidget(self.register_button)
 
         outer.addWidget(self.card, alignment=Qt.AlignCenter)
         outer.addStretch()
@@ -990,10 +1097,23 @@ class LoginScreen(FadeInWidget):
     def login(self) -> None:
         username = self.username_input.text().strip()
         if not username:
-            QMessageBox.warning(self, "Никнейм", "Введите никнейм Freskmid.")
+            QMessageBox.warning(self, "Аккаунт", "Введите никнейм.")
+            return
+        ok, message = self.account_manager.authenticate(username, self.password_input.text())
+        if not ok:
+            QMessageBox.warning(self, "Вход", message)
             return
         if self.remember_check.isChecked():
             self.account_manager.remember(username)
+        self.main_window.show_main_screen(username)
+
+    def register(self) -> None:
+        username = self.username_input.text().strip()
+        ok, message = self.account_manager.register(username, self.password_input.text())
+        if not ok:
+            QMessageBox.warning(self, "Регистрация", message)
+            return
+        QMessageBox.information(self, "VVittox Works Accounts", message)
         self.main_window.show_main_screen(username)
 
     def refresh_theme(self) -> None:
@@ -1019,30 +1139,630 @@ class LoginScreen(FadeInWidget):
             """
         )
         self.username_input.setStyleSheet(self.main_window.input_style())
+        self.password_input.setStyleSheet(self.main_window.input_style())
         self.saved_accounts.setStyleSheet(self.main_window.combo_style())
         self.remember_check.setStyleSheet(
             f"color: {theme['muted']}; font-size: 13px; border: none;"
         )
         self.login_button.refresh_style()
+        self.register_button.refresh_style()
+
+
+class Skin3DWidget(QWidget):
+    def __init__(self, theme_manager: ThemeManager) -> None:
+        super().__init__()
+        self.theme_manager = theme_manager
+        self.skin = QPixmap()
+        self.yaw = -18.0
+        self.zoom = 1.0
+        self.dragging = False
+        self.last_mouse = QPoint()
+        self.setMinimumSize(340, 430)
+        self.setCursor(Qt.OpenHandCursor)
+
+    def set_skin(self, pixmap: QPixmap) -> None:
+        self.skin = pixmap
+        self.update()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self.dragging = True
+            self.last_mouse = event.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self.dragging:
+            self.yaw += (event.pos().x() - self.last_mouse.x()) * 0.8
+            self.last_mouse = event.pos()
+            self.update()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self.dragging = False
+            self.setCursor(Qt.OpenHandCursor)
+
+    def wheelEvent(self, event) -> None:
+        self.zoom = max(0.72, min(1.35, self.zoom + (0.08 if event.angleDelta().y() > 0 else -0.08)))
+        self.update()
+
+    def _color(self, x: int, y: int, width: int, height: int, fallback: str) -> QColor:
+        if self.skin.isNull() or self.skin.width() < 64 or self.skin.height() < 32:
+            return QColor(fallback)
+        image = self.skin.toImage()
+        red = green = blue = count = 0
+        for px in range(x, min(x + width, image.width())):
+            for py in range(y, min(y + height, image.height())):
+                color = QColor(image.pixel(px, py))
+                if color.alpha() == 0:
+                    continue
+                red += color.red()
+                green += color.green()
+                blue += color.blue()
+                count += 1
+        return QColor(red // count, green // count, blue // count) if count else QColor(fallback)
+
+    def _project(self, point: Tuple[float, float, float], scale: float, center_x: float, ground: float) -> QPoint:
+        x, y, z = point
+        angle = math.radians(self.yaw)
+        rotated_x = x * math.cos(angle) - z * math.sin(angle)
+        rotated_z = x * math.sin(angle) + z * math.cos(angle)
+        return QPoint(int(center_x + rotated_x * scale), int(ground - y * scale + rotated_z * scale * 0.28))
+
+    def _cuboid(self, painter: QPainter, center: Tuple[float, float, float], size: Tuple[float, float, float], color: QColor, scale: float, center_x: float, ground: float) -> None:
+        cx, cy, cz = center
+        width, height, depth = size
+        vertices = [
+            (cx - width / 2, cy - height / 2, cz - depth / 2),
+            (cx + width / 2, cy - height / 2, cz - depth / 2),
+            (cx + width / 2, cy + height / 2, cz - depth / 2),
+            (cx - width / 2, cy + height / 2, cz - depth / 2),
+            (cx - width / 2, cy - height / 2, cz + depth / 2),
+            (cx + width / 2, cy - height / 2, cz + depth / 2),
+            (cx + width / 2, cy + height / 2, cz + depth / 2),
+            (cx - width / 2, cy + height / 2, cz + depth / 2),
+        ]
+        faces = [
+            ([0, 1, 2, 3], 0.84), ([4, 5, 6, 7], 1.0),
+            ([0, 4, 7, 3], 0.72), ([1, 5, 6, 2], 0.9),
+            ([3, 2, 6, 7], 1.08), ([0, 1, 5, 4], 0.58),
+        ]
+        projected = [self._project(vertex, scale, center_x, ground) for vertex in vertices]
+        ordered = sorted(faces, key=lambda face: sum(vertices[index][2] for index in face[0]) / 4)
+        for indices, brightness in ordered:
+            shade = QColor(
+                min(255, int(color.red() * brightness)),
+                min(255, int(color.green() * brightness)),
+                min(255, int(color.blue() * brightness)),
+            )
+            painter.setBrush(shade)
+            painter.setPen(QPen(QColor(0, 0, 0, 55), 1))
+            painter.drawPolygon([projected[index] for index in indices])
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        theme = self.theme_manager.get_theme()
+        painter.fillRect(self.rect(), QColor(theme["panel_alt"]))
+
+        scale = min(self.width() / 8.5, self.height() / 8.8) * self.zoom
+        center_x = self.width() / 2
+        ground = self.height() - 32
+        self._cuboid(painter, (0, 6.8, 0), (2.25, 2.25, 2.25), self._color(8, 8, 8, 8, theme["primary"]), scale, center_x, ground)
+        self._cuboid(painter, (0, 4.0, 0), (1.8, 2.5, 1.0), self._color(20, 20, 8, 12, theme["secondary"]), scale, center_x, ground)
+        self._cuboid(painter, (-1.3, 4.0, 0), (0.55, 2.35, 0.8), self._color(44, 20, 4, 12, theme["primary"]), scale, center_x, ground)
+        self._cuboid(painter, (1.3, 4.0, 0), (0.55, 2.35, 0.8), self._color(44, 20, 4, 12, theme["primary"]), scale, center_x, ground)
+        self._cuboid(painter, (-0.48, 1.25, 0), (0.72, 2.5, 0.85), self._color(4, 20, 4, 12, theme["secondary"]), scale, center_x, ground)
+        self._cuboid(painter, (0.48, 1.25, 0), (0.72, 2.5, 0.85), self._color(4, 20, 4, 12, theme["secondary"]), scale, center_x, ground)
+        painter.setPen(QPen(QColor(theme["primary"]), 2))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(self.rect().adjusted(1, 1, -2, -2), 10, 10)
+        painter.setPen(QColor(theme["muted"]))
+        painter.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        painter.drawText(QRect(0, 8, self.width(), 20), Qt.AlignCenter, "ПРЕДПРОСМОТР СКИНА")
+
+
+class ProfileScreen(FadeInWidget):
+    def __init__(self, main_window: "MainWindow") -> None:
+        super().__init__()
+        self.main_window = main_window
+        self.account_manager = main_window.login_screen.account_manager
+        self.skin_path = ""
+        self.init_ui()
+        self.refresh_theme()
+
+    def init_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(70, 35, 70, 35)
+        root.setSpacing(16)
+
+        header = QHBoxLayout()
+        title = QLabel("Профиль")
+        title.setObjectName("profileTitle")
+        self.account_badge = QLabel("VVITTOX WORKS ACCOUNTS")
+        self.account_badge.setObjectName("accountBadge")
+        self.header_face = QLabel()
+        self.header_face.setObjectName("profileHeaderFace")
+        self.header_face.setFixedSize(32, 32)
+        self.header_face.setAlignment(Qt.AlignCenter)
+        back = MinecraftButton("НАЗАД", self.main_window.theme_manager, "secondary")
+        back.setFixedWidth(130)
+        back.clicked.connect(lambda: self.main_window.show_main_screen(self.main_window.current_username))
+        header.addWidget(title)
+        header.addSpacing(14)
+        header.addWidget(self.header_face)
+        header.addWidget(self.account_badge)
+        header.addStretch()
+        header.addWidget(back)
+        self.back_button = back
+
+        body = QHBoxLayout()
+        body.setSpacing(18)
+        self.avatar_card = QFrame()
+        self.avatar_card.setObjectName("profileAvatarCard")
+        avatar_layout = QVBoxLayout(self.avatar_card)
+        avatar_layout.setContentsMargins(22, 22, 22, 22)
+        avatar_layout.setSpacing(12)
+        self.avatar = Skin3DWidget(self.main_window.theme_manager)
+        self.avatar.setToolTip("Зажмите левую кнопку мыши и двигайте, чтобы повернуть персонажа. Колесо меняет масштаб.")
+        self.skin_button = MinecraftButton("Выбрать скин", self.main_window.theme_manager, "secondary")
+        self.skin_button.clicked.connect(self.choose_skin)
+        avatar_layout.addWidget(self.avatar, alignment=Qt.AlignCenter)
+        avatar_layout.addWidget(self.skin_button)
+
+        self.form_card = QFrame()
+        self.form_card.setObjectName("profileFormCard")
+        form = QVBoxLayout(self.form_card)
+        form.setContentsMargins(24, 22, 24, 22)
+        form.setSpacing(10)
+        self.profile_hint = QLabel("Локальный профиль лаунчера. Пароль хранится только в виде хеша.")
+        self.profile_hint.setObjectName("profileHint")
+        self.profile_username = QLineEdit()
+        self.profile_username.setPlaceholderText("Никнейм")
+        self.profile_password = QLineEdit()
+        self.profile_password.setPlaceholderText("Новый пароль (необязательно)")
+        self.profile_password.setEchoMode(QLineEdit.Password)
+        self.save_button = MinecraftButton("Сохранить профиль", self.main_window.theme_manager, "primary")
+        self.save_button.clicked.connect(self.save_profile)
+        form.addWidget(QLabel("Имя аккаунта"))
+        form.addWidget(self.profile_username)
+        form.addWidget(QLabel("Изменить пароль"))
+        form.addWidget(self.profile_password)
+        form.addSpacing(8)
+        form.addWidget(self.profile_hint)
+        form.addStretch()
+        form.addWidget(self.save_button)
+        body.addWidget(self.avatar_card)
+        body.addWidget(self.form_card, 1)
+
+        root.addLayout(header)
+        root.addLayout(body, 1)
+
+    def load_profile(self, username: str) -> None:
+        profile = self.account_manager.get_profile(username)
+        self.profile_username.setText(str(profile.get("username", username)))
+        self.profile_password.clear()
+        self.skin_path = str(profile.get("skin", ""))
+        self.update_avatar()
+
+    def choose_skin(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выберите скин или изображение профиля", "", "Изображения (*.png *.jpg *.jpeg)"
+        )
+        if path:
+            self.skin_path = path
+            self.update_avatar()
+
+    def update_avatar(self) -> None:
+        pixmap = QPixmap(self.skin_path) if self.skin_path else QPixmap()
+        self.avatar.set_skin(pixmap)
+        if pixmap.isNull():
+            self.header_face.clear()
+            self.header_face.setText("?")
+            return
+        face = pixmap.copy(8, 8, 8, 8)
+        self.header_face.setText("")
+        self.header_face.setPixmap(face.scaled(28, 28, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def save_profile(self) -> None:
+        old_username = self.main_window.current_username
+        ok, result = self.account_manager.update_profile(
+            old_username,
+            self.profile_username.text(),
+            self.profile_password.text(),
+            self.skin_path,
+        )
+        if not ok:
+            QMessageBox.warning(self, "Профиль", result)
+            return
+        self.main_window.current_username = result
+        self.main_window.main_screen.set_username(result)
+        self.profile_password.clear()
+        QMessageBox.information(self, "Профиль", "Профиль VVittox Works Accounts сохранён.")
+
+    def refresh_theme(self) -> None:
+        theme = self.main_window.theme_manager.get_theme()
+        self.setStyleSheet(
+            f"""
+            QLabel#profileTitle {{ color: {theme['text']}; font-size: 28px; font-weight: 900; }}
+            QLabel#accountBadge {{ color: {theme['success']}; font-size: 10px; font-weight: 900; letter-spacing: 0.08em; }}
+            QLabel#profileHint {{ color: {theme['muted']}; font-size: 12px; }}
+            QLabel#profileHeaderFace {{ background: {theme['panel_alt']}; color: {theme['muted']}; border: 1px solid {theme['primary']}; border-radius: 5px; font-weight: 900; }}
+            QFrame#profileAvatarCard, QFrame#profileFormCard {{
+                background: {hex_to_rgba(theme['panel'], 235)};
+                border: 1px solid {hex_to_rgba(theme['primary'], 62)};
+                border-radius: 10px;
+            }}
+            QLabel {{ color: {theme['muted']}; }}
+            """
+        )
+        self.profile_username.setStyleSheet(self.main_window.input_style())
+        self.profile_password.setStyleSheet(self.main_window.input_style())
+        self.back_button.refresh_style()
+        self.skin_button.refresh_style()
+        self.save_button.refresh_style()
+
+
+class QuickInfoCard(QFrame):
+    def __init__(self, title: str, value: str, accent: str = "primary") -> None:
+        super().__init__()
+        self.title = title
+        self.value = value
+        self.accent = accent
+        self.setMinimumHeight(92)
+        self.setObjectName("quickInfoCard")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(6)
+
+        self.title_label = QLabel(title)
+        self.title_label.setObjectName("quickCardTitle")
+        self.value_label = QLabel(value)
+        self.value_label.setObjectName("quickCardValue")
+        self.value_label.setWordWrap(True)
+
+        layout.addWidget(self.title_label)
+        layout.addWidget(self.value_label)
+
+    def set_value(self, value: str) -> None:
+        self.value_label.setText(value)
+
+    def refresh_theme(self, theme: Dict[str, str]) -> None:
+        accent = theme[self.accent] if self.accent in theme else theme["primary"]
+        self.setStyleSheet(
+            f"""
+            QFrame#quickInfoCard {{
+                background: {hex_to_rgba(theme['panel_alt'], 245)};
+                border: 1px solid {hex_to_rgba(accent, 75)};
+                border-radius: 9px;
+            }}
+            QFrame#quickInfoCard:hover {{
+                border-color: {accent};
+                background: {hex_to_rgba(theme['panel_alt'], 255)};
+            }}
+            QLabel#quickCardTitle {{
+                color: {theme['muted']};
+                font-size: 10px;
+                font-weight: 800;
+                letter-spacing: 0.08em;
+                text-transform: uppercase;
+                border: none;
+            }}
+            QLabel#quickCardValue {{
+                color: {theme['text']};
+                font-size: 14px;
+                font-weight: 800;
+                border: none;
+            }}
+            """
+        )
+
+
+class ModCard(QFrame):
+    def __init__(self, name: str, details: str, enabled: bool = True) -> None:
+        super().__init__()
+        self.name = name
+        self.enabled = enabled
+        self.setObjectName("modCard")
+        self.setMinimumHeight(76)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(14, 10, 12, 10)
+        layout.setSpacing(12)
+
+        left = QVBoxLayout()
+        title = QLabel(name)
+        title.setObjectName("modTitle")
+        subtitle = QLabel(details)
+        subtitle.setObjectName("modSubtitle")
+        left.addWidget(title)
+        left.addWidget(subtitle)
+
+        self.state = QLabel("Включён" if enabled else "Отключён")
+        self.state.setObjectName("modState")
+
+        self.toggle_button = QPushButton("Отключить" if enabled else "Включить")
+        self.toggle_button.setObjectName("modToggle")
+        self.remove_button = QPushButton("Удалить")
+        self.remove_button.setObjectName("modRemove")
+
+        actions = QHBoxLayout()
+        actions.addWidget(self.state)
+        actions.addWidget(self.toggle_button)
+        actions.addWidget(self.remove_button)
+
+        layout.addLayout(left)
+        layout.addLayout(actions)
+
+    def refresh_theme(self, theme: Dict[str, str]) -> None:
+        self.setStyleSheet(
+            f"""
+            QFrame#modCard {{
+                background: {hex_to_rgba(theme['panel_alt'], 245)};
+                border: 1px solid {hex_to_rgba(theme['primary'], 70)};
+                border-radius: 10px;
+            }}
+            QLabel#modTitle {{
+                color: {theme['text']};
+                font-size: 13px;
+                font-weight: 800;
+                border: none;
+            }}
+            QLabel#modSubtitle {{
+                color: {theme['muted']};
+                font-size: 11px;
+                border: none;
+            }}
+            QLabel#modState {{
+                color: {theme['success']};
+                font-size: 10px;
+                font-weight: 700;
+                border: none;
+            }}
+            QPushButton#modToggle {{
+                background: {hex_to_rgba(theme['primary'], 22)};
+                color: {theme['text']};
+                border: 1px solid {hex_to_rgba(theme['primary'], 70)};
+                border-radius: 6px;
+                padding: 6px 10px;
+                font-size: 10px;
+                font-weight: 700;
+            }}
+            QPushButton#modRemove {{
+                background: {hex_to_rgba('#ff6a55', 18)};
+                color: {theme['text']};
+                border: 1px solid rgba(255,106,85,120);
+                border-radius: 6px;
+                padding: 6px 10px;
+                font-size: 10px;
+                font-weight: 700;
+            }}
+            """
+        )
+
+
+class CurseForgeDownloadThread(QThread):
+    finished_signal = pyqtSignal(str)
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, mod_id: str, version: str, loader: str, source: str = "curseforge") -> None:
+        super().__init__()
+        self.mod_id = mod_id
+        self.version = version
+        self.loader = loader
+        self.source = source
+
+    def run(self) -> None:
+        try:
+            if self.source == "modrinth":
+                self._download_modrinth()
+                return
+            params = {"pageSize": 1, "sortField": 2, "sortOrder": "desc"}
+            if self.version:
+                params["gameVersion"] = self.version
+            if self.loader and self.loader != "Авто":
+                params["modLoaderType"] = {"Forge": 1, "Fabric": 4, "Quilt": 5}.get(self.loader, 0)
+            request = urllib.request.Request(
+                f"{CURSEFORGE_API_URL}/mods/{self.mod_id}/files?{urllib.parse.urlencode(params)}",
+                headers={"x-api-key": CURSEFORGE_API_KEY, "Accept": "application/json"},
+            )
+            with urllib.request.urlopen(request, timeout=25) as response:
+                files = json.loads(response.read().decode("utf-8")).get("data", [])
+            if not files:
+                raise RuntimeError("Для выбранной версии подходящий файл не найден")
+            file_info = files[0]
+            download_url = file_info.get("downloadUrl")
+            if not download_url:
+                raise RuntimeError("CurseForge не предоставил прямую ссылку на файл")
+
+            mods_dir = ensure_mods_folder()
+            filename = str(file_info.get("fileName") or f"curseforge_{self.mod_id}.jar")
+            target = mods_dir / Path(filename).name
+            temporary = target.with_suffix(target.suffix + ".download")
+            download_request = urllib.request.Request(
+                download_url, headers={"User-Agent": "FRESKMID Launcher"}
+            )
+            with urllib.request.urlopen(download_request, timeout=60) as response, open(temporary, "wb") as output:
+                shutil.copyfileobj(response, output)
+            os.replace(temporary, target)
+            self.finished_signal.emit(str(target))
+        except Exception as exc:
+            self.error_signal.emit(str(exc))
+
+    def _download_modrinth(self) -> None:
+        params = {"game_versions": json.dumps([self.version])} if self.version else {}
+        request = urllib.request.Request(
+            f"https://api.modrinth.com/v2/project/{urllib.parse.quote(self.mod_id)}/version?{urllib.parse.urlencode(params)}",
+            headers={"User-Agent": "FRESKMID Launcher"},
+        )
+        with urllib.request.urlopen(request, timeout=25) as response:
+            versions = json.loads(response.read().decode("utf-8"))
+        if not versions or not versions[0].get("files"):
+            raise RuntimeError("Для выбранной версии совместимый файл не найден")
+        file_info = next((item for item in versions[0]["files"] if item.get("primary")), versions[0]["files"][0])
+        download_url = file_info.get("url")
+        filename = Path(str(file_info.get("filename") or f"modrinth_{self.mod_id}.jar")).name
+        target = ensure_mods_folder() / filename
+        temporary = target.with_suffix(target.suffix + ".download")
+        with urllib.request.urlopen(download_url, timeout=60) as response, open(temporary, "wb") as output:
+            shutil.copyfileobj(response, output)
+        os.replace(temporary, target)
+        self.finished_signal.emit(str(target))
+
+
+class ModCatalogCard(QFrame):
+    download_requested = pyqtSignal(str, str)
+
+    def __init__(self, mod: Dict[str, Any], theme_manager: ThemeManager) -> None:
+        super().__init__()
+        self.mod = mod
+        self.theme_manager = theme_manager
+        self.setObjectName("modCatalogCard")
+        self.setMinimumHeight(96)
+        self.setCursor(Qt.PointingHandCursor)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(12)
+
+        self.icon = QLabel()
+        self.icon.setFixedSize(68, 68)
+        self.icon.setAlignment(Qt.AlignCenter)
+        self.icon.setObjectName("modCatalogIcon")
+        layout.addWidget(self.icon)
+
+        info = QVBoxLayout()
+        info.setSpacing(3)
+        self.title = QLabel(str(mod.get("name", "Без названия")))
+        self.title.setObjectName("modCatalogTitle")
+        self.summary = QLabel(str(mod.get("summary", "Описание отсутствует")))
+        self.summary.setObjectName("modCatalogSummary")
+        self.summary.setWordWrap(True)
+        author = str(mod.get("author", "CurseForge"))
+        downloads = int(mod.get("downloads", 0))
+        self.meta = QLabel(f"{author}  •  {downloads:,} загрузок".replace(",", " "))
+        self.meta.setObjectName("modCatalogMeta")
+        info.addWidget(self.title)
+        info.addWidget(self.summary)
+        info.addWidget(self.meta)
+        layout.addLayout(info, 1)
+
+        self.download_button = QPushButton("Скачать")
+        self.download_button.setObjectName("catalogDownloadButton")
+        self.download_button.setCursor(Qt.PointingHandCursor)
+        self.download_button.clicked.connect(
+            lambda: self.download_requested.emit(str(mod["id"]), str(mod.get("source", "curseforge")))
+        )
+        layout.addWidget(self.download_button)
+        self.load_icon()
+        self.refresh_theme()
+
+    def load_icon(self) -> None:
+        icon_url = str(self.mod.get("icon", ""))
+        if not icon_url:
+            return
+        try:
+            request = urllib.request.Request(icon_url, headers={"User-Agent": "FRESKMID Launcher"})
+            with urllib.request.urlopen(request, timeout=8) as response:
+                pixmap = QPixmap()
+                pixmap.loadFromData(response.read())
+            if not pixmap.isNull():
+                self.icon.setPixmap(pixmap.scaled(68, 68, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        except Exception:
+            pass
+
+    def refresh_theme(self) -> None:
+        theme = self.theme_manager.get_theme()
+        self.setStyleSheet(
+            f"""
+            QFrame#modCatalogCard {{
+                background: {hex_to_rgba(theme['panel_alt'], 245)};
+                border: 1px solid {hex_to_rgba(theme['primary'], 58)};
+                border-radius: 9px;
+            }}
+            QFrame#modCatalogCard:hover {{
+                border-color: {theme['primary']};
+                background: {hex_to_rgba(theme['panel_alt'], 255)};
+            }}
+            QLabel#modCatalogIcon {{
+                background: {theme['panel']};
+                color: {theme['muted']};
+                border: 1px solid {hex_to_rgba(theme['primary'], 45)};
+                border-radius: 7px;
+            }}
+            QLabel#modCatalogTitle {{ color: {theme['text']}; font-size: 14px; font-weight: 800; border: none; }}
+            QLabel#modCatalogSummary {{ color: {theme['muted']}; font-size: 11px; border: none; }}
+            QLabel#modCatalogMeta {{ color: {theme['success']}; font-size: 10px; font-weight: 700; border: none; }}
+            QPushButton#catalogDownloadButton {{
+                background: {theme['primary']}; color: #15120c; border: none;
+                border-radius: 6px; padding: 9px 13px; font-weight: 800;
+            }}
+            QPushButton#catalogDownloadButton:hover {{ background: {QColor(theme['primary']).lighter(115).name()}; }}
+            QPushButton#catalogDownloadButton:pressed {{ padding-top: 11px; padding-bottom: 7px; }}
+            """
+        )
+
+
+class SocialButton(QPushButton):
+    def __init__(self, label: str, url: str, theme_manager: ThemeManager) -> None:
+        super().__init__(label)
+        self.url = url
+        self.theme_manager = theme_manager
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(url)
+        self.setMinimumHeight(34)
+        self.refresh_theme()
+        self.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(self.url)))
+
+    def refresh_theme(self) -> None:
+        theme = self.theme_manager.get_theme()
+        self.setStyleSheet(
+            f"""
+            QPushButton {{
+                background: {hex_to_rgba(theme['panel_alt'], 220)};
+                color: {theme['text']};
+                border: 1px solid {hex_to_rgba(theme['primary'], 45)};
+                border-radius: 6px;
+                padding: 6px 8px;
+                font-size: 11px;
+                font-weight: 800;
+                text-align: left;
+            }}
+            QPushButton:hover {{
+                background: {hex_to_rgba(theme['primary'], 35)};
+                border-color: {theme['primary']};
+                padding-left: 11px;
+            }}
+            QPushButton:pressed {{
+                background: {theme['secondary']};
+                color: {theme['text']};
+                padding-left: 13px;
+                padding-top: 8px;
+                padding-bottom: 4px;
+            }}
+            """
+        )
 
 
 class MainScreen(FadeInWidget):
     def __init__(self, main_window: "MainWindow") -> None:
         super().__init__()
         self.main_window = main_window
+        self.quick_cards: List[QuickInfoCard] = []
+        self.version_shortcuts: List[QPushButton] = []
         self.init_ui()
         self.refresh_theme()
 
     def init_ui(self) -> None:
         root = QHBoxLayout(self)
-        root.setContentsMargins(18, 18, 18, 18)
-        root.setSpacing(18)
+        root.setContentsMargins(24, 22, 24, 22)
+        root.setSpacing(22)
 
         self.sidebar = QFrame()
-        self.sidebar.setFixedWidth(225)
+        self.sidebar.setFixedWidth(248)
         side = QVBoxLayout(self.sidebar)
-        side.setContentsMargins(15, 20, 15, 18)
-        side.setSpacing(8)
+        side.setContentsMargins(17, 22, 17, 20)
+        side.setSpacing(9)
 
         logo = QLabel()
         logo.setAlignment(Qt.AlignCenter)
@@ -1057,10 +1777,14 @@ class MainScreen(FadeInWidget):
 
         self.nav_home = NavigationButton("Главная", self.main_window.theme_manager)
         self.nav_home.set_active(True)
+        self.nav_profile = NavigationButton("Профиль", self.main_window.theme_manager)
+        self.nav_mods = NavigationButton("Моды", self.main_window.theme_manager)
         self.nav_settings = NavigationButton("Настройки", self.main_window.theme_manager)
         self.nav_folder = NavigationButton("Папка игры", self.main_window.theme_manager)
         self.nav_logout = NavigationButton("Сменить аккаунт", self.main_window.theme_manager)
 
+        self.nav_mods.clicked.connect(self.main_window.show_mods)
+        self.nav_profile.clicked.connect(self.main_window.show_profile)
         self.nav_settings.clicked.connect(self.main_window.show_settings)
         self.nav_folder.clicked.connect(self.open_game_folder)
         self.nav_logout.clicked.connect(self.main_window.show_login)
@@ -1077,33 +1801,58 @@ class MainScreen(FadeInWidget):
         profile_layout.addWidget(self.profile_caption)
         profile_layout.addWidget(self.profile_name)
 
+        self.socials_caption = QLabel("СОЦСЕТИ VVITTOX")
+        self.socials_caption.setObjectName("caption")
+        self.socials_layout = QVBoxLayout()
+        self.socials_layout.setSpacing(5)
+        self.social_buttons = [
+            SocialButton("Сайт VVITTOX", "https://sites.google.com/view/vvittox/vvittox", self.main_window.theme_manager),
+            SocialButton("Telegram", "https://t.me/+RZWsezO061A2M2Iy", self.main_window.theme_manager),
+            SocialButton("Discord", "https://discord.gg/XUjfd7uucj", self.main_window.theme_manager),
+            SocialButton("GitHub / Freskmid-Launcher", "https://github.com/VVittox/Freskmid-Launcher", self.main_window.theme_manager),
+        ]
+        for button in self.social_buttons:
+            self.socials_layout.addWidget(button)
+
         side.addWidget(logo)
-        side.addSpacing(16)
+        side.addSpacing(19)
         side.addWidget(self.nav_home)
+        side.addWidget(self.nav_profile)
+        side.addWidget(self.nav_mods)
         side.addWidget(self.nav_settings)
         side.addWidget(self.nav_folder)
         side.addStretch()
         side.addWidget(self.profile_card)
+        side.addSpacing(10)
+        side.addWidget(self.socials_caption)
+        side.addLayout(self.socials_layout)
         side.addWidget(self.nav_logout)
 
         content = QVBoxLayout()
-        content.setSpacing(14)
+        content.setSpacing(16)
 
         header_layout = QHBoxLayout()
         title_box = QVBoxLayout()
         self.page_title = QLabel("Главная")
         self.page_title.setObjectName("pageTitle")
+        self.page_title.setMinimumHeight(38)
         self.welcome_label = QLabel("Добро пожаловать")
         self.welcome_label.setObjectName("muted")
+        self.header_skin_face = QLabel("?")
+        self.header_skin_face.setObjectName("mainSkinFace")
+        self.header_skin_face.setAlignment(Qt.AlignCenter)
+        self.header_skin_face.setFixedSize(42, 42)
         title_box.addWidget(self.page_title)
         title_box.addWidget(self.welcome_label)
         header_layout.addLayout(title_box)
         header_layout.addStretch()
+        header_layout.addWidget(self.header_skin_face)
 
-        self.server_banner = FeaturedServerBanner(self.main_window)
-        self.server_banner.clicked.connect(self.main_window.launch_vvittox_land)
+        self.server_banner = PromoBanner(self.main_window)
+        self.server_banner.clicked.connect(self.main_window.launch_game)
 
         self.launch_card = QFrame()
+        self.launch_card.setObjectName("launchCard")
         launch_layout = QGridLayout(self.launch_card)
         launch_layout.setContentsMargins(20, 18, 20, 18)
         launch_layout.setHorizontalSpacing(13)
@@ -1153,14 +1902,42 @@ class MainScreen(FadeInWidget):
         self.progress_card.setVisible(False)
 
         hint = QLabel(
-            "Нажатие на баннер VVITTOX LAND автоматически добавит сервер, "
-            "установит чистую Minecraft 1.12.2 и запустит игру с прямым подключением."
+            "Один рекламный баннер для всех ваших проектов. Выбирайте версию, "
+            "вводите никнейм и запускайте Minecraft без привязки к одному серверу."
         )
         hint.setWordWrap(True)
         hint.setObjectName("hint")
 
+        self.quick_stats = QFrame()
+        quick_layout = QHBoxLayout(self.quick_stats)
+        quick_layout.setContentsMargins(0, 0, 0, 0)
+        quick_layout.setSpacing(12)
+
+        self.version_info_card = QuickInfoCard("Версия", "Выберите сборку", "primary")
+        self.ram_info_card = QuickInfoCard("RAM", f"{self.main_window.settings.get('ram', 4)} GB", "success")
+        self.folder_info_card = QuickInfoCard("Папка", "FRESKMID", "secondary")
+        self.quick_cards = [self.version_info_card, self.ram_info_card, self.folder_info_card]
+        for card in self.quick_cards:
+            quick_layout.addWidget(card)
+
+        self.version_shortcuts_frame = QFrame()
+        shortcut_layout = QHBoxLayout(self.version_shortcuts_frame)
+        shortcut_layout.setContentsMargins(0, 0, 0, 0)
+        shortcut_layout.setSpacing(8)
+        self.version_shortcuts = []
+
+        for version_id in ["1.20.1", "1.19.2", "1.18.2", "1.16.5"]:
+            button = QPushButton(version_id)
+            button.setObjectName("versionShortcut")
+            button.setCursor(Qt.PointingHandCursor)
+            button.clicked.connect(lambda checked=False, value=version_id: self.select_version(value))
+            shortcut_layout.addWidget(button)
+            self.version_shortcuts.append(button)
+
         content.addLayout(header_layout)
         content.addWidget(self.server_banner)
+        content.addWidget(self.quick_stats)
+        content.addWidget(self.version_shortcuts_frame)
         content.addWidget(self.launch_card)
         content.addWidget(self.progress_card)
         content.addWidget(hint)
@@ -1174,27 +1951,44 @@ class MainScreen(FadeInWidget):
 
         ids: List[str] = []
         try:
-            ids = [item["id"] for item in get_version_list()]
+            raw_versions = get_version_list()
+            seen = set()
+            for entry in raw_versions:
+                version_id = str(entry.get("id", "")).strip()
+                if not version_id or version_id in seen:
+                    continue
+                seen.add(version_id)
+                ids.append(version_id)
         except Exception:
-            ids = [VVITTOX_SERVER_VERSION]
+            ids = ["1.20.1", "1.19.2", "1.18.2"]
 
-        if VVITTOX_SERVER_VERSION not in ids:
-            ids.insert(0, VVITTOX_SERVER_VERSION)
+        if not ids:
+            ids = ["1.20.1", "1.19.2", "1.18.2"]
 
-
-        self.version_select.addItem(
-            f"VVITTOX LAND — Vanilla {VVITTOX_SERVER_VERSION}",
-            VVITTOX_SERVER_VERSION,
-        )
         for version_id in ids:
-            if version_id != VVITTOX_SERVER_VERSION:
-                self.version_select.addItem(f"Vanilla {version_id}", version_id)
+            lower = version_id.lower()
+            if "forge" in lower:
+                label = f"Forge {version_id}"
+            elif "fabric" in lower:
+                label = f"Fabric {version_id}"
+            elif "quilt" in lower:
+                label = f"Quilt {version_id}"
+            else:
+                label = f"Vanilla {version_id}"
+            self.version_select.addItem(label, version_id)
 
-        self.version_select.setCurrentIndex(0)
+        if self.version_select.count():
+            self.version_select.setCurrentIndex(0)
 
     def open_game_folder(self) -> None:
         Path(minecraft_directory).mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(minecraft_directory))
+
+    def select_version(self, version_id: str) -> None:
+        index = self.version_select.findData(version_id)
+        if index >= 0:
+            self.version_select.setCurrentIndex(index)
+        self.version_info_card.set_value(version_id)
 
     def set_username(self, username: str) -> None:
         self.username.setText(username)
@@ -1202,6 +1996,24 @@ class MainScreen(FadeInWidget):
         self.welcome_label.setText(
             f"Добро пожаловать, {username}" if username else "Выберите версию и начните игру"
         )
+        self.update_skin_face(username)
+
+    def update_skin_face(self, username: str) -> None:
+        profile = self.main_window.login_screen.account_manager.get_profile(username) if username else {}
+        pixmap = QPixmap(str(profile.get("skin", "")))
+        if pixmap.isNull():
+            self.header_skin_face.setPixmap(QPixmap())
+            self.header_skin_face.setText("?")
+            return
+        face = pixmap.copy(8, 8, 8, 8)
+        self.header_skin_face.setText("")
+        self.header_skin_face.setPixmap(face.scaled(36, 36, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def refresh_runtime_cards(self) -> None:
+        selected = self.version_select.currentData() or self.version_select.currentText()
+        self.version_info_card.set_value(str(selected or "Выберите сборку"))
+        self.ram_info_card.set_value(f"{int(self.main_window.settings.get('ram', 4))} GB")
+        self.folder_info_card.set_value(Path(minecraft_directory).name)
 
     def set_busy(self, busy: bool) -> None:
         self.start_button.setDisabled(busy)
@@ -1216,15 +2028,15 @@ class MainScreen(FadeInWidget):
         panel_style = f"""
             QFrame {{
                 background: {hex_to_rgba(theme['panel'], 235)};
-                border: 1px solid {hex_to_rgba(theme['primary'], 55)};
-                border-radius: 5px;
+                border: 1px solid {hex_to_rgba(theme['primary'], 62)};
+                border-radius: 9px;
             }}
         """
         self.sidebar.setStyleSheet(
             panel_style
             + f"""
             QLabel {{ border: none; color: {theme['text']}; }}
-            QFrame {{ background: {hex_to_rgba(theme['panel'], 242)}; }}
+            QFrame {{ background: {hex_to_rgba(theme['panel'], 242)}; border-radius: 9px; }}
             """
         )
         self.profile_card.setStyleSheet(
@@ -1248,10 +2060,14 @@ class MainScreen(FadeInWidget):
         )
         self.progress_card.setStyleSheet(panel_style)
         self.page_title.setStyleSheet(
-            f"color: {theme['text']}; font-size: 27px; font-weight: 900;"
+            f"color: {theme['text']}; font-size: 30px; font-weight: 900; letter-spacing: 0px;"
         )
         self.welcome_label.setStyleSheet(
             f"color: {theme['muted']}; font-size: 13px;"
+        )
+        self.header_skin_face.setStyleSheet(
+            f"background: {theme['panel_alt']}; color: {theme['muted']}; "
+            f"border: 1px solid {theme['primary']}; border-radius: 7px; font-weight: 900;"
         )
         self.start_progress_label.setStyleSheet(
             f"color: {theme['text']}; font-size: 12px; font-weight: 700; border: none;"
@@ -1261,9 +2077,61 @@ class MainScreen(FadeInWidget):
         self.username.setStyleSheet(self.main_window.input_style())
         self.start_button.refresh_style()
         self.folder_button.refresh_style()
-        for button in (self.nav_home, self.nav_settings, self.nav_folder, self.nav_logout):
+        for card in self.quick_cards:
+            card.refresh_theme(theme)
+        self.quick_stats.setStyleSheet(
+            f"""
+            QFrame {{
+                background: transparent;
+                border: none;
+            }}
+            """
+        )
+        self.version_shortcuts_frame.setStyleSheet(
+            f"""
+            QFrame {{
+                background: transparent;
+                border: none;
+            }}
+            QPushButton#versionShortcut {{
+                background: {hex_to_rgba(theme['panel_alt'], 210)};
+                color: {theme['text']};
+                border: 1px solid {hex_to_rgba(theme['primary'], 60)};
+                border-radius: 6px;
+                padding: 7px 10px;
+                font-size: 11px;
+                font-weight: 800;
+            }}
+            QPushButton#versionShortcut:hover {{
+                background: {hex_to_rgba(theme['primary'], 24)};
+                border-color: {theme['primary']};
+            }}
+            """
+        )
+        for button in self.version_shortcuts:
+            button.setStyleSheet(
+                f"""
+                QPushButton {{
+                    background: {hex_to_rgba(theme['panel_alt'], 210)};
+                    color: {theme['text']};
+                    border: 1px solid {hex_to_rgba(theme['primary'], 60)};
+                    border-radius: 6px;
+                    padding: 7px 10px;
+                    font-size: 11px;
+                    font-weight: 800;
+                }}
+                QPushButton:hover {{
+                    background: {hex_to_rgba(theme['primary'], 24)};
+                    border-color: {theme['primary']};
+                }}
+                """
+            )
+        for button in (self.nav_home, self.nav_profile, self.nav_mods, self.nav_settings, self.nav_folder, self.nav_logout):
             button.refresh_style()
+        for button in self.social_buttons:
+            button.refresh_theme()
         self.server_banner.update()
+        self.refresh_runtime_cards()
 
 
 class SettingsScreen(FadeInWidget):
@@ -1320,9 +2188,24 @@ class SettingsScreen(FadeInWidget):
         perf_layout.addWidget(self.ram_slider, 0, 1)
         perf_layout.addWidget(self.ram_value, 0, 2)
 
+        misc_group = QGroupBox("Дополнительно")
+        misc_layout = QVBoxLayout(misc_group)
+        self.keep_launcher_open = QCheckBox("Оставлять лаунчер открытым после запуска")
+        self.keep_launcher_open.setChecked(bool(self.main_window.settings.get("keep_launcher_open", True)))
+        self.use_java_args = QCheckBox("Пользовательские аргументы Java")
+        self.use_java_args.setChecked(bool(self.main_window.settings.get("use_java_args", False)))
+        self.java_args_field = QLineEdit()
+        self.java_args_field.setPlaceholderText("Например: -XX:+UseG1GC -Dfile.encoding=UTF-8")
+        self.java_args_field.setText(str(self.main_window.settings.get("java_args", "")))
+        self.java_args_field.setVisible(self.use_java_args.isChecked())
+        self.use_java_args.toggled.connect(self.java_args_field.setVisible)
+        misc_layout.addWidget(self.keep_launcher_open)
+        misc_layout.addWidget(self.use_java_args)
+        misc_layout.addWidget(self.java_args_field)
 
         general_layout.addWidget(theme_group)
         general_layout.addWidget(performance_group)
+        general_layout.addWidget(misc_group)
         general_layout.addStretch()
 
         about_layout = QVBoxLayout(self.about_tab)
@@ -1349,7 +2232,12 @@ class SettingsScreen(FadeInWidget):
             self.main_window.apply_theme()
 
     def get_settings(self) -> Dict[str, Any]:
-        return {"ram": self.ram_slider.value()}
+        return {
+            "ram": self.ram_slider.value(),
+            "keep_launcher_open": self.keep_launcher_open.isChecked(),
+            "use_java_args": self.use_java_args.isChecked(),
+            "java_args": self.java_args_field.text().strip(),
+        }
 
     def refresh_theme(self) -> None:
         theme = self.main_window.theme_manager.get_theme()
@@ -1399,6 +2287,7 @@ class SettingsScreen(FadeInWidget):
             """
         )
         self.theme_combo.setStyleSheet(self.main_window.combo_style())
+        self.java_args_field.setStyleSheet(self.main_window.input_style())
         self.ram_slider.setStyleSheet(self.main_window.slider_style())
         self.about_text.setStyleSheet(
             f"background: {theme['panel_alt']}; color: {theme['text']}; border: none; padding: 14px;"
@@ -1406,12 +2295,218 @@ class SettingsScreen(FadeInWidget):
         self.back_button.refresh_style()
 
 
+class ModsScreen(FadeInWidget):
+    def __init__(self, main_window: "MainWindow") -> None:
+        super().__init__()
+        self.main_window = main_window
+        self.mod_cards: List[ModCard] = []
+        self.init_ui()
+        self.refresh_theme()
+
+    def init_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(70, 35, 70, 35)
+        root.setSpacing(14)
+
+        header = QHBoxLayout()
+        title = QLabel("Моды")
+        title.setObjectName("modsTitle")
+        back = MinecraftButton("НАЗАД", self.main_window.theme_manager, "secondary")
+        back.setFixedWidth(130)
+        back.clicked.connect(lambda: self.main_window.show_main_screen(self.main_window.current_username))
+        header.addWidget(title)
+        header.addStretch()
+        header.addWidget(back)
+        self.back_button = back
+
+        controls = QHBoxLayout()
+        self.loader_combo = QComboBox()
+        self.loader_combo.addItems(["Vanilla", "Forge", "Fabric", "Quilt", "Авто"])
+        self.loader_combo.setCurrentText("Vanilla")
+
+        self.add_mod_button = MinecraftButton("Добавить мод", self.main_window.theme_manager, "primary")
+        self.add_mod_button.clicked.connect(self.add_mod)
+        self.mods_folder_button = MinecraftButton("Папка модов", self.main_window.theme_manager, "secondary")
+        self.mods_folder_button.clicked.connect(self.main_window.open_mods_folder)
+        self.download_button = MinecraftButton("Скачать из URL", self.main_window.theme_manager, "secondary")
+        self.download_button.clicked.connect(self.download_mod)
+
+        controls.addWidget(QLabel("Загрузчик: "))
+        controls.addWidget(self.loader_combo)
+        controls.addStretch()
+        controls.addWidget(self.mods_folder_button)
+        controls.addWidget(self.add_mod_button)
+        controls.addWidget(self.download_button)
+
+        self.url_field = QLineEdit()
+        self.url_field.setPlaceholderText("Прямая ссылка на мод / CurseForge .jar")
+
+        installed_title = QLabel("Установленные моды")
+        installed_title.setObjectName("installedModsTitle")
+
+        self.mods_scroll = QScrollArea()
+        self.mods_scroll.setWidgetResizable(True)
+        self.mods_scroll.setFrameShape(QFrame.NoFrame)
+        self.mods_scroll_content = QWidget()
+        self.mods_layout = QVBoxLayout(self.mods_scroll_content)
+        self.mods_layout.setSpacing(10)
+        self.mods_layout.setContentsMargins(0, 0, 0, 0)
+        self.mods_scroll.setWidget(self.mods_scroll_content)
+
+        root.addLayout(header)
+        root.addLayout(controls)
+        root.addWidget(self.url_field)
+        root.addWidget(installed_title)
+        root.addWidget(self.mods_scroll)
+
+        self.refresh_mods_list()
+
+    def refresh_mods_list(self) -> None:
+        self.mod_cards = []
+        for widget in list(self.mods_layout.children()):
+            if isinstance(widget, QWidget):
+                widget.deleteLater()
+
+        mods_dir = ensure_mods_folder()
+        mod_files = []
+        for path in sorted(mods_dir.iterdir()):
+            is_mod = path.suffix.lower() in {".jar", ".zip"}
+            is_disabled_mod = path.name.lower().endswith((".jar.disabled", ".zip.disabled"))
+            if path.is_file() and (is_mod or is_disabled_mod):
+                mod_files.append(path)
+
+        if not mod_files:
+            empty = QLabel("Папка модов пуста. Добавьте .jar или .zip файл.")
+            empty.setObjectName("modEmptyLabel")
+            self.mods_layout.addWidget(empty)
+        else:
+            for path in mod_files:
+                extension = ".jar" if ".jar" in path.name.lower() else ".zip"
+                enabled = not path.name.lower().endswith(".disabled")
+                details = f"{extension.upper().lstrip('.')} • {path.stat().st_size // 1024} KB"
+                card = ModCard(path.name, details, enabled)
+                card.refresh_theme(self.main_window.theme_manager.get_theme())
+                card.toggle_button.clicked.connect(lambda checked=False, p=path: self.toggle_mod(p))
+                card.remove_button.clicked.connect(lambda checked=False, p=path: self.remove_mod(p))
+                self.mod_cards.append(card)
+                self.mods_layout.addWidget(card)
+
+    def add_mod(self) -> None:
+        mods_dir = ensure_mods_folder()
+        file_name, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выберите мод",
+            str(mods_dir),
+            "Minecraft mods (*.jar *.zip);;Все файлы (*.*)",
+        )
+        if not file_name:
+            return
+        target = Path(file_name)
+        try:
+            shutil.copy2(target, mods_dir / target.name)
+            self.refresh_mods_list()
+            QMessageBox.information(self, "Мод", f"Файл добавлен: {mods_dir / target.name}")
+        except OSError as exc:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось добавить мод:\n{exc}")
+
+    def toggle_mod(self, path: Path) -> None:
+        try:
+            if path.name.endswith(".disabled"):
+                new_path = path.with_name(path.name.replace(".disabled", ""))
+                path.rename(new_path)
+            else:
+                new_path = path.with_name(path.name + ".disabled")
+                path.rename(new_path)
+            self.refresh_mods_list()
+        except OSError as exc:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось переключить мод:\n{exc}")
+
+    def remove_mod(self, path: Path) -> None:
+        try:
+            path.unlink()
+            self.refresh_mods_list()
+        except OSError as exc:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось удалить мод:\n{exc}")
+
+    def download_mod(self) -> None:
+        url = self.url_field.text().strip()
+        if not url:
+            QMessageBox.warning(self, "Ссылка", "Введите ссылку на mod или .jar файл.")
+            return
+        mods_dir = ensure_mods_folder()
+        try:
+            parsed = urllib.parse.urlparse(url)
+            filename = os.path.basename(parsed.path) or "downloaded_mod.jar"
+            if not filename.lower().endswith((".jar", ".zip")):
+                filename += ".jar"
+            target = mods_dir / filename
+            with urllib.request.urlopen(url, timeout=30) as response, open(target, "wb") as out:
+                shutil.copyfileobj(response, out)
+            self.refresh_mods_list()
+            QMessageBox.information(self, "Мод", f"Загружено в папку модов:\n{target}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Ошибка загрузки", f"Не удалось скачать мод:\n{exc}")
+
+    def refresh_theme(self) -> None:
+        theme = self.main_window.theme_manager.get_theme()
+        self.setStyleSheet(
+            f"""
+            QLabel#modsTitle {{
+                color: {theme['text']};
+                font-size: 28px;
+                font-weight: 900;
+            }}
+            QLabel#catalogTitle, QLabel#installedModsTitle {{
+                color: {theme['text']};
+                font-size: 16px;
+                font-weight: 900;
+                padding-top: 4px;
+            }}
+            QLabel#catalogStatus {{
+                color: {theme['muted']};
+                font-size: 11px;
+                padding: 2px 0;
+            }}
+            QLabel#modEmptyLabel {{
+                color: {theme['muted']};
+                font-size: 13px;
+                padding: 14px;
+                border: 1px dashed {hex_to_rgba(theme['primary'], 60)};
+                border-radius: 8px;
+            }}
+            QComboBox {{
+                background: {theme['panel_alt']};
+                color: {theme['text']};
+                border: 1px solid {hex_to_rgba(theme['primary'], 55)};
+                border-radius: 5px;
+                padding: 8px 12px;
+                font-size: 13px;
+            }}
+            QLineEdit {{
+                background: {theme['panel_alt']};
+                color: {theme['text']};
+                border: 1px solid {hex_to_rgba(theme['primary'], 55)};
+                border-radius: 5px;
+                padding: 9px 12px;
+                font-size: 13px;
+            }}
+            QScrollArea {{ background: transparent; border: none; }}
+            """
+        )
+        self.back_button.refresh_style()
+        self.add_mod_button.refresh_style()
+        self.mods_folder_button.refresh_style()
+        self.download_button.refresh_style()
+        for card in self.mod_cards:
+            card.refresh_theme(theme)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.resize(1060, 650)
-        self.setMinimumSize(930, 570)
+        self.resize(1280, 780)
+        self.setMinimumSize(1080, 680)
         self.current_username = ""
         self.settings: Dict[str, Any] = {"ram": min(4, get_max_ram())}
         self.theme_manager = ThemeManager()
@@ -1432,10 +2527,14 @@ class MainWindow(QMainWindow):
 
         self.login_screen = LoginScreen(self)
         self.main_screen = MainScreen(self)
+        self.profile_screen = ProfileScreen(self)
         self.settings_screen = SettingsScreen(self)
+        self.mods_screen = ModsScreen(self)
         self.stacked_widget.addWidget(self.login_screen)
         self.stacked_widget.addWidget(self.main_screen)
+        self.stacked_widget.addWidget(self.profile_screen)
         self.stacked_widget.addWidget(self.settings_screen)
+        self.stacked_widget.addWidget(self.mods_screen)
         self.stacked_widget.setCurrentWidget(self.login_screen)
 
         self.launch_thread = LaunchThread()
@@ -1457,6 +2556,12 @@ class MainWindow(QMainWindow):
                 self.theme_manager.set_theme(theme_name)
             ram = int(data.get("ram", self.settings["ram"]))
             self.settings["ram"] = min(max(2, ram), get_max_ram())
+            self.settings["mods_enabled"] = bool(data.get("mods_enabled", True))
+            self.settings["mod_loader"] = str(data.get("mod_loader", "Vanilla"))
+            self.settings["curseforge_url"] = str(data.get("curseforge_url", ""))
+            self.settings["keep_launcher_open"] = bool(data.get("keep_launcher_open", True))
+            self.settings["use_java_args"] = bool(data.get("use_java_args", False))
+            self.settings["java_args"] = str(data.get("java_args", ""))
         except (OSError, ValueError, TypeError):
             pass
 
@@ -1464,6 +2569,12 @@ class MainWindow(QMainWindow):
         data = {
             "theme": self.theme_manager.current_theme,
             "ram": int(self.settings.get("ram", 4)),
+            "mods_enabled": bool(self.settings.get("mods_enabled", True)),
+            "mod_loader": str(self.settings.get("mod_loader", "Vanilla")),
+            "curseforge_url": str(self.settings.get("curseforge_url", "")),
+            "keep_launcher_open": bool(self.settings.get("keep_launcher_open", True)),
+            "use_java_args": bool(self.settings.get("use_java_args", False)),
+            "java_args": str(self.settings.get("java_args", "")),
         }
         try:
             (DATA_DIR / SETTINGS_FILE).write_text(
@@ -1573,13 +2684,20 @@ class MainWindow(QMainWindow):
         self.background.reset_visuals()
         self.login_screen.refresh_theme()
         self.main_screen.refresh_theme()
+        self.profile_screen.refresh_theme()
         self.settings_screen.refresh_theme()
+        self.main_screen.refresh_runtime_cards()
         self.save_settings()
+
+    def open_mods_folder(self) -> None:
+        mods_dir = ensure_mods_folder()
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(mods_dir)))
 
     def show_main_screen(self, username: str = "") -> None:
         if username:
             self.current_username = username
         self.main_screen.set_username(self.current_username)
+        self.main_screen.refresh_runtime_cards()
         self.stacked_widget.setCurrentWidget(self.main_screen)
 
     def show_login(self) -> None:
@@ -1593,12 +2711,27 @@ class MainWindow(QMainWindow):
         self.settings = self.settings_screen.get_settings()
         self.stacked_widget.setCurrentWidget(self.settings_screen)
 
+    def show_profile(self) -> None:
+        if self.launch_thread.isRunning():
+            return
+        if not self.current_username:
+            self.show_login()
+            return
+        self.profile_screen.load_profile(self.current_username)
+        self.stacked_widget.setCurrentWidget(self.profile_screen)
+
+    def show_mods(self) -> None:
+        if self.launch_thread.isRunning():
+            return
+        self.mods_screen.refresh_mods_list()
+        self.stacked_widget.setCurrentWidget(self.mods_screen)
+
     def reload_server_banner(self) -> None:
         self.main_screen.server_banner.reload_banner()
         QMessageBox.information(
             self,
             "Баннер",
-            f"Баннер перечитан из assets/{VVITTOX_BANNER_FILE}",
+            f"Баннер перечитан из assets/{PROMO_BANNER_FILE}",
         )
 
     def _validated_username(self) -> Optional[str]:
@@ -1610,7 +2743,7 @@ class MainWindow(QMainWindow):
         self.main_screen.set_username(username)
         return username
 
-    def _start_launch(self, version_id: str, direct_server: bool) -> None:
+    def _start_launch(self, version_id: str) -> None:
         if self.launch_thread.isRunning():
             return
         username = self._validated_username()
@@ -1619,21 +2752,20 @@ class MainWindow(QMainWindow):
 
         self.settings = self.settings_screen.get_settings()
         self.save_settings()
-        self.launch_thread.configure(version_id, username, self.settings, direct_server)
-        self.main_screen.start_button.setText(
-            "ПОДГОТОВКА…" if not direct_server else "VVITTOX LAND…"
-        )
+
+        if self.settings.get("mods_enabled", True):
+            ensure_mods_folder()
+            selected_loader = str(self.settings.get("mod_loader", "Vanilla"))
+            if selected_loader not in ("Vanilla", "Авто"):
+                self.main_screen.start_button.setText(f"{selected_loader.upper()}…")
+
+        self.launch_thread.configure(version_id, username, self.settings)
+        self.main_screen.start_button.setText("ПОДГОТОВКА…")
         self.launch_thread.start()
 
     def launch_game(self) -> None:
         selected = self.main_screen.version_select.currentData()
-        self._start_launch(str(selected or self.main_screen.version_select.currentText()), False)
-
-    def launch_vvittox_land(self) -> None:
-        index = self.main_screen.version_select.findData(VVITTOX_SERVER_VERSION)
-        if index >= 0:
-            self.main_screen.version_select.setCurrentIndex(index)
-        self._start_launch(VVITTOX_SERVER_VERSION, True)
+        self._start_launch(str(selected or self.main_screen.version_select.currentText()))
 
     def state_update(self, busy: bool) -> None:
         self.main_screen.set_busy(busy)
